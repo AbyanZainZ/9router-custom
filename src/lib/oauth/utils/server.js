@@ -971,3 +971,125 @@ export function stopXiaomiMimoProxy() {
   xiaomiMimoSessions.clear();
 }
 
+// ==========================================
+// AutoClaw Callback Proxy & Session Manager
+// ==========================================
+const autoclawSessions = new Map();
+let autoclawProxyServer = null;
+let autoclawProxyPort = 18432;
+let autoclawProxyTimeout = null;
+
+export function registerAutoClawSession(state, deviceId, authMethod = "google", navigateUri = null) {
+  autoclawSessions.set(state, {
+    state,
+    deviceId,
+    authMethod,
+    navigateUri,
+    status: "pending",
+    code: null,
+    error: null,
+    tokens: null,
+    createdAt: Date.now(),
+  });
+}
+
+export function getAutoClawSessionStatus(state) {
+  return autoclawSessions.get(state) || null;
+}
+
+export function clearAutoClawSession(state) {
+  autoclawSessions.delete(state);
+}
+
+export function handleAutoClawCallback(urlObj) {
+  const code = urlObj.searchParams.get("code");
+  const state = urlObj.searchParams.get("state");
+  const error = urlObj.searchParams.get("error");
+
+  let session = state ? autoclawSessions.get(state) : null;
+  if (!session && autoclawSessions.size === 1) {
+    session = [...autoclawSessions.values()][0];
+  }
+
+  if (!session) {
+    return { success: false, error: "Session expired or not found" };
+  }
+
+  if (error) {
+    session.status = "error";
+    session.error = error;
+    return { success: false, error };
+  }
+
+  if (!code) {
+    session.status = "error";
+    session.error = "No code received in callback";
+    return { success: false, error: session.error };
+  }
+
+  session.code = code;
+  session.status = "exchanging";
+  return { success: true, code, state: session.state };
+}
+
+export function startAutoClawProxy(port = 18432) {
+  return new Promise((resolve) => {
+    if (autoclawProxyServer) {
+      resolve({ success: true, port: autoclawProxyPort });
+      return;
+    }
+
+    const server = http.createServer((req, res) => {
+      const url = new URL(req.url, `http://localhost:${port}`);
+      if (
+        url.pathname === "/auth/callback-google" ||
+        url.pathname === "/auth/callback-zai" ||
+        url.pathname === "/callback"
+      ) {
+        const result = handleAutoClawCallback(url);
+        res.writeHead(result.success ? 200 : 400, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>AutoClaw Login</title>
+<style>body{font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#f5f5f5}.c{text-align:center;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.1)}.ok{color:#22c55e;font-size:3rem}.err{color:#ef4444;font-size:3rem}h1{margin:1rem 0}p{color:#666}</style>
+</head><body><div class="c">
+<div class="${result.success ? "ok" : "err"}">${result.success ? "&#10003;" : "&#10007;"}</div>
+<h1>${result.success ? "AutoClaw Authentication Successful" : "Authentication Failed"}</h1>
+<p>${result.success ? "Closing in <span id=\"cd\">3</span>s..." : (result.error || "Unknown error")}</p>
+${result.success ? "<script>let n=3;const c=document.getElementById(\"cd\");const t=setInterval(()=>{n--;c.textContent=n;if(n<=0){clearInterval(t);window.close();}},1000);</script>" : ""}
+</div></body></html>`);
+      } else {
+        res.writeHead(404);
+        res.end("Not found");
+      }
+    });
+
+    server.on("error", (err) => {
+      console.log("[autoclaw oauth] server error:", err.message);
+      if (err.code === "EADDRINUSE") {
+        resolve({ success: false, reason: "port_busy", error: err.message });
+      } else {
+        resolve({ success: false, reason: err.message, error: err.message });
+      }
+    });
+
+    server.listen(port, "127.0.0.1", () => {
+      autoclawProxyServer = server;
+      autoclawProxyPort = port;
+      if (autoclawProxyTimeout) clearTimeout(autoclawProxyTimeout);
+      autoclawProxyTimeout = setTimeout(() => {
+        stopAutoClawProxy();
+      }, 300000);
+      resolve({ success: true, port });
+    });
+  });
+}
+
+export function stopAutoClawProxy() {
+  if (autoclawProxyTimeout) {
+    clearTimeout(autoclawProxyTimeout);
+    autoclawProxyTimeout = null;
+  }
+  if (autoclawProxyServer) {
+    autoclawProxyServer.close();
+    autoclawProxyServer = null;
+  }
+}

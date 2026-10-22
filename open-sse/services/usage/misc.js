@@ -2,6 +2,8 @@
  * Misc usage handlers (iFlow, Ollama, GLM, Vercel AI Gateway, Qoder)
  */
 
+import crypto from "crypto";
+import { PROVIDER_OAUTH } from "../../providers/index.js";
 import { proxyAwareFetch } from "../../utils/proxyFetch.js";
 import { U } from "./shared.js";
 
@@ -320,5 +322,131 @@ export async function getQoderUsage(accessToken, proxyOptions = null, providerId
     };
   } catch (error) {
     return { message: `Qoder connected. Unable to fetch usage: ${error.message}` };
+  }
+}
+
+// The task id AutoClaw's "Daily Check In" banner claims (400 pts/day).
+export const AUTOCLAW_DAILY_SIGNIN_TASK_ID = "daily_signin";
+
+function autoClawAppHeaders() {
+  const oauth = PROVIDER_OAUTH["autoclaw"] || {};
+  const appId = oauth.appId || "100003";
+  const appKey = oauth.appKey || "38d2391985e2369a5fb8227d8e6cd5e5";
+  const ts = String(Math.floor(Date.now() / 1000));
+  const sign = crypto
+    .createHash("md5")
+    .update(`${appId}&${ts}&${appKey}`)
+    .digest("hex");
+  return {
+    "X-Auth-Appid": appId,
+    "X-Auth-TimeStamp": ts,
+    "X-Auth-Sign": sign,
+    "X-Product": "autoclaw",
+    "X-Version": oauth.appVersion || "1.17.8",
+    "X-Tm": "mac",
+    "X-Lang": "en",
+    "X-Client-Type": "pc",
+    "X-Trace-Id": crypto.randomUUID(),
+    Accept: "application/json",
+  };
+}
+
+function autoClawBearer(token) {
+  const t = String(token || "");
+  return t.startsWith("Bearer ") ? t : `Bearer ${t}`;
+}
+
+/**
+ * Fetch the AutoClaw client-task list. The daily check-in status lives here
+ * (task_id "daily_signin": status, reward_points, completed flag).
+ * @returns {Promise<{ok:boolean, tasks?:Array, error?:string}>}
+ */
+export async function getAutoClawTasks(accessToken, lang = "en", proxyOptions = null) {
+  if (!accessToken) {
+    return { ok: false, error: "AutoClaw access token not available." };
+  }
+  try {
+    const url = `${AUTOCLAW_API_BASE}${AUTOCLAW_TASK_LIST_PATH}?lang=${encodeURIComponent(lang)}`;
+    const res = await proxyAwareFetch(
+      url,
+      {
+        method: "GET",
+        headers: { ...autoClawAppHeaders(), authorization: autoClawBearer(accessToken) },
+      },
+      proxyOptions,
+    );
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, error: "AutoClaw access token invalid or expired." };
+    }
+    if (!res.ok) {
+      return { ok: false, error: `AutoClaw task-list HTTP ${res.status}` };
+    }
+    const json = await res.json().catch(() => null);
+    if (!json) {
+      return { ok: false, error: "AutoClaw task-list non-JSON response." };
+    }
+    if (json.code != null && json.code !== 0) {
+      return { ok: false, error: `AutoClaw task-list error: ${json.msg || json.code}` };
+    }
+    const tasks = Array.isArray(json.data) ? json.data : json.data?.tasks || [];
+    return { ok: true, tasks };
+  } catch (error) {
+    return { ok: false, error: `AutoClaw task-list error: ${error.message}` };
+  }
+}
+
+/**
+ * Claim an AutoClaw client-task reward. Defaults to the daily check-in.
+ * @returns {Promise<{ok:boolean, taskId?:string, alreadyCompleted?:boolean, rewardPoints?:number, message?:string, error?:string}>}
+ */
+export async function checkInAutoClaw(
+  accessToken,
+  providerSpecificData = null,
+  proxyOptions = null,
+  taskId = AUTOCLAW_DAILY_SIGNIN_TASK_ID,
+) {
+  if (!accessToken) {
+    return { ok: false, error: "AutoClaw access token not available." };
+  }
+  try {
+    const res = await proxyAwareFetch(
+      `${AUTOCLAW_API_BASE}${AUTOCLAW_TASK_COMPLETE_PATH}`,
+      {
+        method: "POST",
+        headers: {
+          ...autoClawAppHeaders(),
+          "Content-Type": "application/json",
+          authorization: autoClawBearer(accessToken),
+        },
+        body: JSON.stringify({ task_id: taskId }),
+      },
+      proxyOptions,
+    );
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, error: "AutoClaw access token invalid or expired." };
+    }
+    if (!res.ok) {
+      return { ok: false, error: `AutoClaw task-complete HTTP ${res.status}` };
+    }
+    const json = await res.json().catch(() => null);
+    if (!json) {
+      return { ok: false, error: "AutoClaw task-complete non-JSON response." };
+    }
+    if (json.code != null && json.code !== 0) {
+      return { ok: false, error: `AutoClaw task-complete error: ${json.msg || json.code}` };
+    }
+    const data = json.data || {};
+    const rewardPoints = Number(data.reward_points) || 0;
+    return {
+      ok: true,
+      taskId,
+      alreadyCompleted: !!data.already_completed,
+      rewardPoints,
+      message: data.already_completed
+        ? "Already checked in today."
+        : `Checked in successfully. +${rewardPoints} points.`,
+    };
+  } catch (error) {
+    return { ok: false, error: `AutoClaw task-complete error: ${error.message}` };
   }
 }

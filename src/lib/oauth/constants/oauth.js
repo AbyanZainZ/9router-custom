@@ -225,6 +225,11 @@ export const ZED_HOSTED_CONFIG = {
 };
 
 // Nous Research Portal — OAuth 2.0 Device Code flow (RFC 8628) + agent key minting
+
+// AutoClaw OAuth Configuration
+export const AUTOCLAW_CONFIG = { ...PROVIDER_OAUTH["autoclaw"] };
+export const AUTOCLOW_CONFIG = AUTOCLAW_CONFIG;
+
 export const NOUS_CONFIG = {
   clientId: "hermes-cli",
   portalBaseUrl: "https://portal.nousresearch.com",
@@ -266,4 +271,5 @@ export const PROVIDERS = {
   GLM: "glm",
   ZED: "zed",
   NOUS: "nous",
+  AUTOCLAW: "autoclaw",
 };

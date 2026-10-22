@@ -35,6 +35,12 @@ $skipChanged = @(
   "src\shared\components\index.js",          # MERGE below (BulkAccount export)
   "package.json",                            # MERGE below (playwright + camoufox-js)
   "src\app\api\providers\[id]\test\testUtils.js", # MERGE below (custom probe)
+  "open-sse\services\usage\misc.js",         # AutoClaw checkin & task complete
+  "src\lib\oauth\constants\oauth.js",        # AutoClaw OAuth config
+  "src\lib\oauth\providers\index.js",        # AutoClaw OAuth provider
+  "src\lib\oauth\utils\server.js",           # AutoClaw proxy server & session
+  "src\app\api\oauth\[provider]\[action]\route.js", # AutoClaw device flow
+  "src\shared\components\OAuthModal.js",     # AutoClaw device flow UI
   # providers/[id] UI keeps AutoClaw check-in + expiring badge (global refactored these):
   "src\app\(dashboard)\dashboard\providers\[id]\AddApiKeyModal.js",
   "src\app\(dashboard)\dashboard\providers\[id]\AddCustomModelModal.js",

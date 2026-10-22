@@ -40,6 +40,7 @@ import {
   registerXiaomiMimoSession,
   getXiaomiMimoSessionStatus,
   clearXiaomiMimoSession,
+  stopAutoClawProxy,
 } from "@/lib/oauth/utils/server";
 import { detectIdeInstalled } from "@/lib/oauth/utils/ideDetect";
 import { ZED_HOSTED_CONFIG } from "@/lib/oauth/constants/oauth";
@@ -222,6 +223,7 @@ export async function GET(request, { params }) {
       else if (provider === "xai") stopXaiProxy();
       else if (provider === "codex") stopCodexProxy();
       else if (provider === "xiaomi-mimo") stopXiaomiMimoProxy();
+      else if (provider === "autoclaw") stopAutoClawProxy();
       else return NextResponse.json({ error: "Proxy only supported for codex/xai/trae/windsurf/zed/xiaomi-mimo" }, { status: 400 });
       return NextResponse.json({ success: true });
     }
@@ -268,6 +270,7 @@ export async function GET(request, { params }) {
         "muse",
         "glm",
         "nous",
+        "autoclaw",
       ];
       let deviceData;
       if (noPkceDeviceProviders.includes(provider)) {
