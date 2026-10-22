@@ -49,6 +49,11 @@ $skipChanged = @(
   "src\app\(dashboard)\dashboard\providers\[id]\PassthroughModelsSection.js"
 )
 
+function Write-Utf8NoBom($file, $text) {
+  $enc = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($file, $text, $enc)
+}
+
 function Copy-GlobalFile($rel) {
   $gf = Join-Path $global_ $rel; $lf = Join-Path $local $rel
   $d = Split-Path -Parent $lf
@@ -63,7 +68,7 @@ function Ensure-Contains($file, $marker, $insertAfter, $block) {
   if ($idx -lt 0) { Write-Host "  WARN: anchor not found in $file" -ForegroundColor Yellow; return $false }
   $pos = $idx + $insertAfter.Length
   $c = $c.Substring(0, $pos) + $block + $c.Substring($pos)
-  Set-Content -LiteralPath $file -Value $c -Encoding UTF8
+  Write-Utf8NoBom $file $c
   return $true
 }
 
@@ -76,7 +81,7 @@ if (!(Test-Path -LiteralPath "$global_\package.json")) { Write-Host "  Clone fai
 $gver = (Get-Content "$global_\package.json" | ConvertFrom-Json).version
 $lover = (Get-Content "$local\package.json" | ConvertFrom-Json).version
 Write-Host "  $lover -> $gver"
-if ($gver -le $lover) { Write-Host "  Already up to date." -ForegroundColor Yellow; exit 0 }
+if ([version]$gver -le [version]$lover) { Write-Host "  Already up to date." -ForegroundColor Yellow; exit 0 }
 
 Write-Host "=== [2/6] Copy files (skip customs) ===" -ForegroundColor Cyan
 $copied = 0; $skipped = 0
@@ -97,7 +102,8 @@ Write-Host "  Updated+New: $copied  Skipped(custom): $skipped"
 Write-Host "=== [3/6] Merge: Sidebar + registry/index + components/index ===" -ForegroundColor Cyan
 Copy-GlobalFile 'src\shared\components\Sidebar.js'
 $sb = Join-Path $local 'src\shared\components\Sidebar.js'
-Ensure-Contains $sb '/dashboard/automation' '  { href: "/dashboard/cli-tools", label: "CLI Tools", icon: "terminal" },' "`r`n  // Local custom: bulk OAuth automation (AutoClaw / CodeBuddy / Qoder / Agnes).`r`n  // Kept as a merge marker so upstream updates don't drop it again.`r`n  { href: "/dashboard/automation", label: "Automation", icon: "smart_toy" }," | Out-Null
+$autoNav = "`r`n  // Local custom: bulk OAuth automation (AutoClaw / CodeBuddy / Qoder / Agnes).`r`n  // Kept as a merge marker so upstream updates don't drop it again.`r`n  { href: `"/dashboard/automation`", label: `"Automation`", icon: `"smart_toy`" },"
+Ensure-Contains $sb '/dashboard/automation' '  { href: "/dashboard/cli-tools", label: "CLI Tools", icon: "terminal" },' $autoNav | Out-Null
 Write-Host "  Sidebar: Automation entry ensured"
 
 Copy-GlobalFile 'open-sse\providers\registry\index.js'
@@ -110,7 +116,7 @@ if (!$c.Contains('import c0 from "./agnes-ai.js";')) {
   $c = $c.Replace('export default [', '// Local custom providers (Agnes global/CN, AutoClaw, GNRT, InferHub, Routeway, Infron, Empero).' + "`r`n" + 'import c0 from "./agnes-ai.js";' + "`r`n" + 'import c1 from "./agnes-ai-cn.js";' + "`r`n" + 'import c2 from "./autoclaw.js";' + "`r`n" + 'import c3 from "./gnrt.js";' + "`r`n" + 'import c4 from "./inferhub.js";' + "`r`n" + 'import c5 from "./routeway.js";' + "`r`n" + 'import c6 from "./infron.js";' + "`r`n" + 'import c7 from "./empero-free.js";' + "`r`n" + 'export default [')
   $c = $c.Replace("];", "  // Local custom providers (see c-imports above).`r`n  c0,`r`n  c1,`r`n  c2,`r`n  c3,`r`n  c4,`r`n  c5,`r`n  c6,`r`n  c7,`r`n];")
 }
-Set-Content -LiteralPath $ri -Value $c -Encoding UTF8
+Write-Utf8NoBom $ri $c
 Write-Host "  registry/index: 4 new providers kept, agnes.js excluded, c0-c7 restored"
 
 Copy-GlobalFile 'src\shared\components\index.js'
@@ -144,7 +150,7 @@ $cc = Get-Content -LiteralPath $cap -Raw
 if (!$cc.Contains('"routeway"')) {
   $anchor = '    "deepseek-ai/deepseek-v4-flash": { reasoning: true, thinkingFormat: "openai", contextWindow: 1000000, maxOutput: 65536 },'
   $cc = $cc.Replace($anchor, $anchor + "`r`n" + $capRouteway.TrimEnd())
-  Set-Content -LiteralPath $cap -Value $cc -Encoding UTF8
+  Write-Utf8NoBom $cap $cc
 }
 $agnesBlock = @'
   // Local custom: Agnes (global + CN) — OpenAI-compatible, OpenAI-style reasoning_effort.
@@ -210,7 +216,7 @@ if (!$cc.Contains('"agnes-ai"')) {
   $anchor2 = '    "deepseek-v4.1-flash:cloud": { vision: true, reasoning: true, thinkingFormat: "deepseek", contextWindow: 1000000, maxOutput: 384000 },'
   if ($cc.Contains($anchor2)) {
     $cc = $cc.Replace($anchor2, $anchor2 + "`r`n" + $agnesBlock.TrimEnd())
-    Set-Content -LiteralPath $cap -Value $cc -Encoding UTF8
+    Write-Utf8NoBom $cap $cc
   } else { Write-Host "  WARN: ollama anchor not found for agnes blocks" -ForegroundColor Yellow }
 }
 $agnesPat = @'
@@ -226,7 +232,7 @@ if (!$cc.Contains('*agnes-3.0-flash*')) {
   $anchor3 = '{ pattern: "*glm*",           caps: { reasoning: true, thinkingFormat: "zai", contextWindow: 200000 } },'
   if ($cc.Contains($anchor3)) {
     $cc = $cc.Replace($anchor3, $anchor3 + "`r`n" + $agnesPat.TrimEnd())
-    Set-Content -LiteralPath $cap -Value $cc -Encoding UTF8
+    Write-Utf8NoBom $cap $cc
   } else { Write-Host "  WARN: glm anchor not found for agnes patterns" -ForegroundColor Yellow }
 }
 Write-Host "  capabilities: custom blocks ensured"
@@ -241,7 +247,7 @@ if (!$ncContent.Contains('camoufox-js')) {
   } else {
     $ncContent = $ncContent.Replace('serverExternalPackages: ["better-sqlite3", "sql.js", "node:sqlite", "bun:sqlite", "open"]', 'serverExternalPackages: ["better-sqlite3", "sql.js", "node:sqlite", "bun:sqlite", "open", "camoufox-js", "impit", "playwright"]')
   }
-  Set-Content -LiteralPath $nc -Value $ncContent -Encoding UTF8
+  Write-Utf8NoBom $nc $ncContent
 }
 Write-Host "  next.config: camoufox/impit/playwright externals ensured (systemone rewrite from global kept)"
 
@@ -249,7 +255,7 @@ Copy-GlobalFile 'package.json'
 $pj = Get-Content -LiteralPath (Join-Path $local 'package.json') -Raw | ConvertFrom-Json
 if (!$pj.dependencies.PSObject.Properties['playwright']) { $pj.dependencies | Add-Member -NotePropertyName 'playwright' -NotePropertyValue '^1.63.0' }
 if (!$pj.dependencies.PSObject.Properties['camoufox-js']) { $pj.dependencies | Add-Member -NotePropertyName 'camoufox-js' -NotePropertyValue '^0.12.0' }
-$pj | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $local 'package.json') -Encoding UTF8
+Write-Utf8NoBom (Join-Path $local 'package.json') ($pj | ConvertTo-Json -Depth 10)
 Write-Host "  package.json: v$($pj.version) + playwright/camoufox kept"
 
 Copy-GlobalFile 'src\app\api\providers\[id]\test\testUtils.js'
@@ -257,7 +263,7 @@ $tu = Join-Path $local 'src\app\api\providers\[id]\test\testUtils.js'
 $tuContent = Get-Content -LiteralPath $tu -Raw
 if (!$tuContent.Contains('"agnes-ai"')) {
   $tuContent = $tuContent.Replace('      case "agnes":', '      case "agnes":' + "`r`n" + '      // Local custom providers — same generic validateUrl probe as the aggregators above.' + "`r`n" + '      case "agnes-ai":' + "`r`n" + '      case "agnes-ai-cn":' + "`r`n" + '      case "routeway":' + "`r`n" + '      case "infron":' + "`r`n" + '      case "empero-free":')
-  Set-Content -LiteralPath $tu -Value $tuContent -Encoding UTF8
+  Write-Utf8NoBom $tu $tuContent
 }
 Write-Host "  testUtils: custom provider probe ensured"
 
