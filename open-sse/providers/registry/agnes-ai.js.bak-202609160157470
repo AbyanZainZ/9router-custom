@@ -1,0 +1,29 @@
+export default {
+  id: "agnes-ai",
+  priority: 222,
+  alias: "agnes",
+  aliases: ["agnes-ai", "agnesai"],
+  uiAlias: "agnes",
+  display: {
+    name: "Agnes AI",
+    icon: "bolt",
+    color: "#0EA5E9",
+    textIcon: "AG",
+    website: "https://platform.agnes-ai.com/",
+    notice: {
+      text: "OpenAI-compatible gateway. Create an API key in the Agnes AI console (Settings → API Keys).",
+      apiKeyUrl: "https://platform.agnes-ai.com/settings/apiKeys",
+    },
+  },
+  category: "apikey",
+  authType: "apikey",
+  transport: {
+    baseUrl: "https://apihub.agnes-ai.com/v1/chat/completions",
+    format: "openai",
+    validateUrl: "https://apihub.agnes-ai.com/v1/models",
+    auth: { combined: true, header: "Authorization", scheme: "bearer" },
+  },
+  models: [
+    { id: "agnes-3.0-flash", name: "Agnes 3.0 Flash" },
+  ],
+};
