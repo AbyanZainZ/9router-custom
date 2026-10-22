@@ -766,6 +766,36 @@ export function parseQuotaData(provider, data) {
         }
         break;
 
+      case "autoclaw":
+        // Credit wallets (total + per-bucket balances). Pass `isCreditBalance`
+        // through so the row renders as 💰 "Credit: 9,137 credits" instead of
+        // computing a meaningless percentage from used/total.
+        if (data.message && !data.quotas) {
+          normalizedQuotas.push({
+            name: "error",
+            used: 0,
+            total: 0,
+            resetAt: null,
+            message: data.message,
+          });
+        }
+        if (data.quotas) {
+          Object.entries(data.quotas).forEach(([name, quota]) => {
+            normalizedQuotas.push({
+              name,
+              used: quota.used || 0,
+              total: quota.total || 0,
+              resetAt: quota.resetAt || null,
+              remaining: quota.remaining,
+              remainingPercentage: quota.remainingPercentage,
+              isCreditBalance: quota.isCreditBalance,
+              currency: quota.currency,
+              detailUrl: quota.detailUrl || null,
+            });
+          });
+        }
+        break;
+
       case "minimax-code":
       case "minimax-code-global":
         // Service already returns dashboard-shaped rows: a credits balance

@@ -325,6 +325,12 @@ export async function getQoderUsage(accessToken, proxyOptions = null, providerId
   }
 }
 
+const AUTOCLAW_API_BASE = "https://autoglm-api.autoglm.ai";
+const AUTOCLAW_WALLETS_PATH = "/agent-assetmgr/api/v2/wallets";
+const AUTOCLAW_WALLET_INSTANCES_PATH = "/agent-assetmgr/api/v1/wallet-instances";
+const AUTOCLAW_TASK_LIST_PATH = "/autoclaw-proxy/proxy/autoclaw-task-list";
+const AUTOCLAW_TASK_COMPLETE_PATH = "/autoclaw-proxy/proxy/autoclaw-task-complete";
+
 // The task id AutoClaw's "Daily Check In" banner claims (400 pts/day).
 export const AUTOCLAW_DAILY_SIGNIN_TASK_ID = "daily_signin";
 
@@ -342,9 +348,10 @@ function autoClawAppHeaders() {
     "X-Auth-TimeStamp": ts,
     "X-Auth-Sign": sign,
     "X-Product": "autoclaw",
-    "X-Version": oauth.appVersion || "1.17.8",
-    "X-Tm": "mac",
-    "X-Lang": "en",
+    "X-Version": oauth.appVersion || "2.2.1",
+    "X-Channel": oauth.channel || "AutoClaw5",
+    "X-Tm": "win",
+    "X-Lang": "zh-CN",
     "X-Client-Type": "pc",
     "X-Trace-Id": crypto.randomUUID(),
     Accept: "application/json",
@@ -393,6 +400,306 @@ export async function getAutoClawTasks(accessToken, lang = "en", proxyOptions = 
   } catch (error) {
     return { ok: false, error: `AutoClaw task-list error: ${error.message}` };
   }
+}
+
+// AutoClaw sells credits, not rate-limit windows. The v2 wallet endpoint
+// returns one total plus per-bucket balances; older accounts only have the
+// wallet-instances endpoint. display_name ships in Chinese, so the labels are
+// ours.
+const AUTOCLAW_WALLET_LABELS = {
+  reward: "Reward points",
+  earned: "Earned points",
+  daily: "Daily points",
+  monthly: "Monthly credits",
+  long_term: "Long-term credits",
+  annual: "Annual credits",
+  campaign: "Campaign credits",
+  subscription: "Subscription credits",
+  fuel_pack: "Fuel pack",
+  other: "Other credits",
+};
+
+function autoClawNumber(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const cleaned = value.replace(/,/g, "").trim();
+    if (cleaned) {
+      const n = Number(cleaned);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
+function autoClawWalletKey(wallet) {
+  const raw = wallet.public_wallet_type || wallet.wallet_type || wallet.wallet_scope || "";
+  return String(raw).trim().toLowerCase().replace(/^wallet_scope_/, "");
+}
+
+function autoClawWalletLabel(wallet, key) {
+  return AUTOCLAW_WALLET_LABELS[key] || (key ? key.replace(/_/g, " ") : "Credits");
+}
+
+/**
+ * AutoClaw credit balance (wallets + per-bucket breakdown).
+ * @returns {Promise<{quotas?:Object, message?:string}>}
+ */
+export async function getAutoClawUsage(accessToken, proxyOptions = null) {
+  if (!accessToken) {
+    return { message: "AutoClaw access token not available." };
+  }
+
+  const headers = { ...autoClawAppHeaders(), authorization: autoClawBearer(accessToken) };
+
+  const readEnvelope = async (path, query) => {
+    const qs = new URLSearchParams(query).toString();
+    const res = await proxyAwareFetch(
+      `${AUTOCLAW_API_BASE}${path}${qs ? `?${qs}` : ""}`,
+      { method: "GET", headers },
+      proxyOptions,
+    );
+    if (res.status === 401 || res.status === 403) {
+      return { error: "AutoClaw access token invalid or expired." };
+    }
+    if (!res.ok) return { error: `AutoClaw wallet HTTP ${res.status}` };
+    const json = await res.json().catch(() => null);
+    if (!json) return { error: "AutoClaw wallet non-JSON response." };
+    if (json.code != null && json.code !== 0) {
+      return { error: `AutoClaw wallet error: ${json.msg || json.code}` };
+    }
+    return { data: json.data || {} };
+  };
+
+  try {
+    let total = null;
+    let wallets = [];
+
+    const primary = await readEnvelope(AUTOCLAW_WALLETS_PATH, { biz_app_id: "autoclaw" });
+    if (!primary.error && Array.isArray(primary.data.wallets)) {
+      total = autoClawNumber(primary.data.total_balance);
+      wallets = primary.data.wallets
+        .filter((w) => w && w.display !== false)
+        .sort(
+          (a, b) =>
+            (autoClawNumber(a.priority) ?? Number.MAX_SAFE_INTEGER) -
+            (autoClawNumber(b.priority) ?? Number.MAX_SAFE_INTEGER),
+        )
+        .map((w) => {
+          const key = autoClawWalletKey(w);
+          return { key, label: autoClawWalletLabel(w, key), balance: autoClawNumber(w.balance) };
+        });
+    }
+
+    if (total === null) {
+      const legacy = await readEnvelope(AUTOCLAW_WALLET_INSTANCES_PATH, {
+        wallet_type: "all",
+        wallet_scope: "all",
+      });
+      if (legacy.error) return { message: legacy.error };
+      total = autoClawNumber(legacy.data.total_balance);
+      wallets = (Array.isArray(legacy.data.wallet_instances) ? legacy.data.wallet_instances : [])
+        .filter(
+          (w) =>
+            w &&
+            w.display !== false &&
+            String(w.status || "active").toLowerCase() === "active",
+        )
+        .map((w) => {
+          const key = autoClawWalletKey(w);
+          return { key, label: autoClawWalletLabel(w, key), balance: autoClawNumber(w.balance) };
+        });
+    }
+
+    const quotas = {
+      Credits: {
+        used: 0,
+        total: total ?? 0,
+        isCreditBalance: true,
+        currency: "credits",
+        detailUrl: "https://autoclaw.z.ai/web/",
+      },
+    };
+
+    const used = new Set(["credits"]);
+    for (const wallet of wallets) {
+      if (!Number.isFinite(wallet.balance)) continue;
+      let name = wallet.label;
+      // Two buckets can share a label (reward + earned); keep both readable.
+      if (used.has(name.toLowerCase())) name = `${name} (${wallet.key})`;
+      if (used.has(name.toLowerCase())) continue;
+      used.add(name.toLowerCase());
+      quotas[name] = {
+        used: 0,
+        total: wallet.balance,
+        isCreditBalance: true,
+        currency: "credits",
+        detailUrl: "https://autoclaw.z.ai/web/",
+      };
+    }
+
+    return { quotas };
+  } catch (error) {
+    return { message: `AutoClaw usage error: ${error.message}` };
+  }
+}
+
+/** Credit balance across every wallet - used to measure what a claim added. */
+export async function getAutoClawWalletTotal(accessToken, proxyOptions = null) {
+  if (!accessToken) return null;
+  try {
+    const res = await proxyAwareFetch(
+      `${AUTOCLAW_API_BASE}${AUTOCLAW_WALLETS_PATH}?biz_app_id=autoclaw`,
+      {
+        method: "GET",
+        headers: { ...autoClawAppHeaders(), authorization: autoClawBearer(accessToken) },
+      },
+      proxyOptions,
+    );
+    if (!res.ok) return null;
+    const json = await res.json().catch(() => null);
+    if (!json || (json.code != null && json.code !== 0)) return null;
+    return autoClawNumber(json.data?.total_balance);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Trigger AutoClaw's "user active" login reward.
+ *
+ * The desktop client calls user-info on every start; that is what grants the
+ * daily login credits (ledger event "autoclaw_user_active", currently 500/day
+ * during the Oct 19-25 event). Same call also reports whether the daily
+ * check-in was completed by the request itself.
+ */
+export async function claimAutoClawLoginReward(accessToken, deviceId, proxyOptions = null) {
+  if (!accessToken) {
+    return { ok: false, error: "AutoClaw access token not available." };
+  }
+  try {
+    const res = await proxyAwareFetch(
+      `${AUTOCLAW_API_BASE}/userapi/v1/user-info`,
+      {
+        method: "POST",
+        headers: {
+          ...autoClawAppHeaders(),
+          "Content-Type": "application/json",
+          authorization: autoClawBearer(accessToken),
+        },
+        body: JSON.stringify({
+          source_id: "autoclaw",
+          device_id: deviceId || crypto.randomUUID(),
+        }),
+      },
+      proxyOptions,
+    );
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, error: "AutoClaw access token invalid or expired." };
+    }
+    if (!res.ok) return { ok: false, error: `AutoClaw user-info HTTP ${res.status}` };
+    const json = await res.json().catch(() => null);
+    if (!json) return { ok: false, error: "AutoClaw user-info non-JSON response." };
+    if (json.code != null && json.code !== 0) {
+      return { ok: false, error: `AutoClaw user-info error: ${json.msg || json.code}` };
+    }
+    return {
+      ok: true,
+      dailyCheckInCompletedOnRequest: json.data?.daily_check_in_completed_on_request === true,
+    };
+  } catch (error) {
+    return { ok: false, error: `AutoClaw user-info error: ${error.message}` };
+  }
+}
+
+/** Numeric AutoClaw account id carried by the access token. */
+function autoClawUserId(accessToken) {
+  try {
+    const payload = String(accessToken).replace(/^Bearer\s+/i, "").split(".")[1];
+    const json = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    const uid = json.uid ?? json.user_id ?? json.numeric_user_id;
+    return uid == null ? null : String(uid);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Bind a friend's invite code to this account (referral activity
+ * "autoclaw_fission"). One-time per account; the reward goes to the code owner.
+ */
+export async function bindAutoClawInviteCode(accessToken, deviceId, inviteCode, proxyOptions = null) {
+  const code = String(inviteCode || "").trim();
+  if (!accessToken) return { ok: false, error: "AutoClaw access token not available." };
+  if (!code) return { ok: false, error: "Invite code is empty." };
+
+  try {
+    const res = await proxyAwareFetch(
+      `${AUTOCLAW_API_BASE}/agent-assetmgr/api/v1/fission-v2/bind`,
+      {
+        method: "POST",
+        headers: {
+          ...autoClawAppHeaders(),
+          "Content-Type": "application/json",
+          authorization: autoClawBearer(accessToken),
+        },
+        body: JSON.stringify({
+          activity_id: "autoclaw_fission",
+          business: "autoclaw",
+          invite_code: code,
+          source_id: "autoclaw",
+          device_id: deviceId || crypto.randomUUID(),
+        }),
+      },
+      proxyOptions,
+    );
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, error: "AutoClaw access token invalid or expired." };
+    }
+    const json = await res.json().catch(() => null);
+    if (!json) return { ok: false, error: `AutoClaw invite bind HTTP ${res.status}` };
+    if (json.code !== 0) {
+      const message =
+        json.code === 400001 || json.code === 650005
+          ? `Invite code is not valid for this account${json.msg ? ` (${json.msg})` : ""}.`
+          : `AutoClaw invite bind error: ${json.msg || json.code}`;
+      return { ok: false, code: json.code, error: message };
+    }
+    return { ok: true, message: "Invite code bound" };
+  } catch (error) {
+    return { ok: false, error: `AutoClaw invite bind error: ${error.message}` };
+  }
+}
+
+/**
+ * Referral link from the "invite_friends" client task. The template ships with
+ * {{userId}} / {{token}} placeholders that the desktop client fills in.
+ */
+export async function getAutoClawInviteUrl(
+  accessToken,
+  { appVersion = "2.2.1", os = "win", lang = "en" } = {},
+  proxyOptions = null,
+) {
+  const list = await getAutoClawTasks(accessToken, lang, proxyOptions);
+  if (!list.ok) return { ok: false, error: list.error };
+  const task = (list.tasks || []).find((t) => t && t.task_id === "invite_friends");
+  const template = task?.metadata?.url;
+  if (!template) return { ok: false, error: "AutoClaw did not return an invite link." };
+
+  const token = String(accessToken || "").replace(/^Bearer\s+/i, "");
+  const uid = autoClawUserId(token) || "";
+  const url = String(template)
+    .split("{{name}}").join("AutoClaw")
+    .split("{{version}}").join(appVersion)
+    .split("{{os}}").join(os)
+    .split("{{userId}}").join(uid)
+    .split("{{token}}").join(token);
+
+  return {
+    ok: true,
+    url,
+    invited: Number(task.current_count) || 0,
+    target: Number(task.target_count) || 0,
+  };
 }
 
 /**

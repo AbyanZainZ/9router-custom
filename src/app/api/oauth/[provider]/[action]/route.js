@@ -7,6 +7,7 @@ import {
   requestDeviceCode,
   pollForToken
 } from "@/lib/oauth/providers";
+import { fetchAutoClawCaptchaConfig } from "@/lib/oauth/providers/autoclaw";
 import { createProviderConnection } from "@/models";
 import { readDesktopPassToken } from "open-sse/shared/mimoAccount.js";
 import {
@@ -43,6 +44,7 @@ import {
   stopAutoClawProxy,
 } from "@/lib/oauth/utils/server";
 import { detectIdeInstalled } from "@/lib/oauth/utils/ideDetect";
+import { detectAutoClawInstalled, getAutoClawLocalAccount } from "@/lib/oauth/utils/autoclawLocal";
 import { ZED_HOSTED_CONFIG } from "@/lib/oauth/constants/oauth";
 
 async function completeXaiManualCode(code, state) {
@@ -95,6 +97,17 @@ export async function GET(request, { params }) {
   try {
     const { provider, action } = await params;
     const { searchParams } = new URL(request.url);
+
+    // AutoClaw gates its OAuth URL behind a captcha; the modal asks for the
+    // challenge config first so it can render the widget before connecting.
+    if (action === "captcha-config") {
+      if (provider !== "autoclaw") {
+        return NextResponse.json({ error: "captcha-config only supported for autoclaw" }, { status: 400 });
+      }
+      const config = getProvider("autoclaw").config;
+      const captcha = await fetchAutoClawCaptchaConfig(config);
+      return NextResponse.json({ ...captcha, sdkUrl: config.captchaSdkUrl || null });
+    }
 
     if (action === "authorize") {
       // Xiaomi Desktop: custom ECDH flow — generate keypair, start proxy, return authorize URL
@@ -229,12 +242,50 @@ export async function GET(request, { params }) {
     }
 
     if (action === "ide-status") {
+      if (provider === "autoclaw") {
+        const status = await detectAutoClawInstalled();
+        return NextResponse.json(status);
+      }
       // Detect whether the IDE is installed locally (used by import-token UX).
       if (provider !== "trae" && provider !== "windsurf") {
         return NextResponse.json({ error: "ide-status only supported for trae/windsurf" }, { status: 400 });
       }
       const status = await detectIdeInstalled(provider);
       return NextResponse.json(status);
+    }
+
+    if (action === "import-local") {
+      if (provider !== "autoclaw") {
+        return NextResponse.json({ error: "import-local only supported for autoclaw" }, { status: 400 });
+      }
+      const account = await getAutoClawLocalAccount();
+      if (!account || !account.accessToken) {
+        return NextResponse.json({ error: "No active AutoClaw desktop account found. Please sign in to the AutoClaw app first." }, { status: 404 });
+      }
+      const connection = await createProviderConnection({
+        provider: "autoclaw",
+        authType: "oauth",
+        accessToken: account.accessToken,
+        refreshToken: account.refreshToken,
+        email: account.email,
+        displayName: account.displayName,
+        expiresAt: new Date(Date.now() + 86400 * 1000).toISOString(),
+        providerSpecificData: {
+          sourceId: "autoclaw",
+          deviceId: account.deviceId,
+          authMethod: "oauth",
+        },
+        testStatus: "active",
+      });
+      return NextResponse.json({
+        success: true,
+        connection: {
+          id: connection.id,
+          provider: connection.provider,
+          email: connection.email,
+          displayName: connection.displayName,
+        },
+      });
     }
 
     if (action === "device-code") {
@@ -247,13 +298,16 @@ export async function GET(request, { params }) {
       const startUrl = searchParams.get("start_url");
       const region = searchParams.get("region");
       const authMethod = searchParams.get("auth_method");
+      const captchaParam = searchParams.get("captcha_param");
       const deviceOptions = provider === "kiro"
         ? {
             ...(startUrl ? { startUrl } : {}),
             ...(region ? { region } : {}),
             ...(authMethod ? { authMethod } : {}),
           }
-        : undefined;
+        : provider === "autoclaw" && captchaParam
+          ? { captchaParam }
+          : undefined;
       
       // Providers that don't use PKCE for device code (Grok CLI HAR: plain device_code, no challenge)
       const noPkceDeviceProviders = [
@@ -305,6 +359,22 @@ export async function POST(request, { params }) {
       body = await request.json();
     } catch {
       return NextResponse.json({ error: "Invalid or empty request body" }, { status: 400 });
+    }
+
+    // POST variant of device-code: the captcha verify param is too long (and too
+    // sensitive) to ride in a query string.
+    if (action === "device-code" && provider === "autoclaw") {
+      const authData = await generateAuthData(provider, null);
+      const deviceData = await requestDeviceCode(provider, undefined, {
+        ...(body?.captchaParam ? { captchaParam: body.captchaParam } : {}),
+        // "google" = legacy AutoClaw Google client; "zai" = the unified Z.AI
+        // account system (accounts created after the migration only exist there).
+        ...(body?.authMethod === "zai" ? { authMethod: "zai" } : {}),
+      });
+      return NextResponse.json({
+        ...deviceData,
+        codeVerifier: deviceData.codeVerifier || authData.codeVerifier,
+      });
     }
 
     if (action === "register-session") {
@@ -504,7 +574,7 @@ export async function POST(request, { params }) {
       }
 
       // Providers that don't use PKCE for device code
-      const noPkceProviders = ["github", "kimi", "kimi-coding", "kilocode", "codebuddy-cn", "codebuddy-intl", "glm", "nous"];
+      const noPkceProviders = ["github", "kimi", "kimi-coding", "kilocode", "codebuddy-cn", "codebuddy-intl", "glm", "nous", "autoclaw"];
       let result;
       if (noPkceProviders.includes(provider)) {
         // kimi needs extraData._kimiDeviceId for stable X-Msh-Device-Id (CLIProxyAPI parity)

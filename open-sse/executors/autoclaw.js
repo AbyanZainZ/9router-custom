@@ -58,11 +58,11 @@ export class AutoClawExecutor extends DefaultExecutor {
 
     const oauth = PROVIDER_OAUTH.autoclaw || {};
     // Match current AutoClaw desktop headers.
-    headers["X-Tm"] = "mac";
-    headers["X-Version"] = oauth.appVersion || "1.18.4";
+    headers["X-Tm"] = "win";
+    headers["X-Version"] = oauth.appVersion || "2.2.1";
     headers["X-Product"] = "autoclaw";
-    headers["X-Channel"] = "official";
-    headers["X-Lang"] = "en";
+    headers["X-Channel"] = oauth.channel || "AutoClaw5";
+    headers["X-Lang"] = "zh-CN";
     headers["X-Client-Type"] = "pc";
     headers["X-Request-Id"] = randomUUID();
     // These session headers are sent by the AutoClaw desktop gateway and are
@@ -127,13 +127,16 @@ export class AutoClawExecutor extends DefaultExecutor {
             "X-Auth-TimeStamp": ts,
             "X-Auth-Sign": sign,
             "X-Product": "autoclaw",
-            "X-Version": cfg.appVersion || "1.18.4",
-            "X-Tm": "mac",
+            "X-Version": cfg.appVersion || "2.2.1",
+            "X-Channel": cfg.channel || "AutoClaw5",
+            "X-Tm": "win",
+            "X-Lang": "zh-CN",
             "X-Trace-Id": randomUUID(),
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
             refresh_token: credentials.refreshToken,
+            source_id: "autoclaw",
             device_id: deviceId,
           }),
         },

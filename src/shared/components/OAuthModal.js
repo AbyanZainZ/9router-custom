@@ -5,6 +5,48 @@ import PropTypes from "prop-types";
 import { Modal, Button, Input } from "@/shared/components";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 
+// AutoClaw only issues an OAuth URL when the request carries a solved captcha.
+// The Aliyun SDK is loaded on demand so other providers pay nothing for it.
+const AUTOCLAW_CAPTCHA_TRIGGER = "#autoclaw-captcha-trigger";
+const AUTOCLAW_CAPTCHA_SDK_URL =
+  "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
+
+// The Aliyun SDK derives its API host and signing key from
+// window.AliyunCaptchaConfig, read while it bootstraps - before
+// initAliyunCaptcha() is reached. Without it the SDK falls back to region "cn"
+// (its built-in default) even though AutoClaw's scene lives in another region
+// ("ga" today): the widget still renders, but the proof comes from the wrong
+// service and AutoClaw answers 630014 ("审核失败"). The desktop client sets
+// exactly this global before loading the SDK, so do the same.
+function applyAutoClawCaptchaConfig({ region, prefix } = {}) {
+  if (typeof window === "undefined") return;
+  const config = {};
+  if (region) config.region = region;
+  if (prefix) config.prefix = prefix;
+  window.AliyunCaptchaConfig = config;
+}
+
+// 630014 = the server refused the captcha proof (a missing/blank proof is
+// 631002 instead), i.e. the challenge has to be solved again - not a broken
+// connection.
+function isAutoClawCaptchaRejection(message) {
+  return typeof message === "string" && message.includes("code=630014");
+}
+
+function loadAutoClawCaptchaSdk(src) {
+  if (typeof window === "undefined") return Promise.reject(new Error("Captcha is unavailable"));
+  if (typeof window.initAliyunCaptcha === "function") return Promise.resolve();
+  if (!src) return Promise.reject(new Error("Missing AutoClaw captcha SDK URL"));
+  return new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = src;
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Failed to load the AutoClaw captcha SDK"));
+    document.head.appendChild(script);
+  });
+}
+
 // Providers using the dynamic-port local callback proxy.
 // Browser OAuth: popup → auto callback → auto exchange → poll-status.
 const PROXY_OAUTH_PROVIDERS = new Set(["trae", "windsurf", "zed"]);
@@ -47,7 +89,20 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
   const [authMode, setAuthMode] = useState("browser"); // "browser" | "paste-token"
   const [pasteToken, setPasteToken] = useState("");
   const [ideStatus, setIdeStatus] = useState(null);
+  const [importingLocal, setImportingLocal] = useState(false);
+  // AutoClaw sign-in method: "google" (legacy AutoClaw client) or "zai"
+  // (unified account system - required for accounts created after the migration).
+  // The Aliyun widget keeps the callback it was initialised with, so the chosen
+  // method lives in a ref - a state value would be a stale closure there.
+  const [autoClawAuthMethod, setAutoClawAuthMethod] = useState("google");
+  const autoClawMethodRef = useRef("google");
+  const pendingAutoClawRef = useRef(null);
+  // AutoClaw captcha: idle | loading | ready | unsupported | error
+  const [captchaStatus, setCaptchaStatus] = useState("idle");
+  const [captchaError, setCaptchaError] = useState(null);
   const popupRef = useRef(null);
+  const captchaInstanceRef = useRef(null);
+  const initAutoClawCaptchaRef = useRef(null);
   const pollingAbortRef = useRef(false);
   const openedRef = useRef(false);
   // Proxy-flow session ledger: which provider's proxy THIS modal session
@@ -181,6 +236,14 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
 
         if (data.error === "slow_down") {
           interval = Math.min(interval + 5, 30);
+          continue;
+        }
+
+        // Any other error is final too - the server only marks a poll as pending
+        // while it is genuinely still waiting. Swallowing the rest is what made a
+        // rejected token exchange look like an endless "Waiting for authorization".
+        if (data.error && !data.pending) {
+          throw new Error(data.errorDescription || data.error);
         }
       } catch (err) {
         setError(err.message);
@@ -194,6 +257,161 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
     setStep("error");
     setPolling(false);
   }, [provider]);
+
+  // AutoClaw: the OAuth URL is issued only for a solved captcha, so the device
+  // flow starts from the captcha callback instead of on modal open.
+  const startAutoClawDeviceFlow = useCallback(async (captchaVerifyParam) => {
+    setIsDeviceCode(true);
+    setStep("waiting");
+    const authMethod = autoClawMethodRef.current === "zai" ? "zai" : "google";
+    // POST: the verify param is long and short-lived, keep it out of the URL.
+    const res = await fetch(`/api/oauth/${provider}/device-code`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        captchaParam: captchaVerifyParam,
+        ...(authMethod === "zai" ? { authMethod } : {}),
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Failed to start AutoClaw login");
+
+    setDeviceData(data);
+    const verifyUrl = data.verification_uri_complete || data.verification_uri;
+    if (verifyUrl) window.open(verifyUrl, "_blank", "noopener,noreferrer");
+    startPolling(
+      data.device_code || data.user_code,
+      data.codeVerifier,
+      data.interval || 2,
+      null,
+      Number.isFinite(data.expires_in) && data.expires_in > 0 ? data.expires_in * 1000 : undefined,
+    );
+  }, [provider, startPolling]);
+
+  // Fetch the challenge AutoClaw wants and mount the Aliyun widget once per open.
+  const initAutoClawCaptcha = useCallback(async () => {
+    if (provider !== "autoclaw") return;
+    // The widget is already mounted: re-initialising would stack a second
+    // instance on the same DOM nodes, so just re-open the challenge.
+    if (captchaInstanceRef.current) {
+      setCaptchaStatus("ready");
+      document.querySelector(AUTOCLAW_CAPTCHA_TRIGGER)?.click();
+      return;
+    }
+    setCaptchaStatus("loading");
+    setCaptchaError(null);
+    try {
+      const res = await fetch("/api/oauth/autoclaw/captcha-config");
+      const config = await res.json();
+      if (!res.ok) throw new Error(config.error || "Failed to load the AutoClaw captcha config");
+      if (!config.enabled) {
+        setCaptchaStatus("unsupported");
+        setCaptchaError(
+          config.supplier && config.supplier !== "aliyun"
+            ? `AutoClaw now asks for a ${config.supplier} captcha, which this build cannot render. Use "1-Click Import from App" instead.`
+            : 'AutoClaw did not return a usable captcha config. Use "1-Click Import from App" instead.',
+        );
+        return;
+      }
+      // Region + prefix must exist before the SDK's bootstrap request runs,
+      // otherwise every challenge is issued for the "cn" backend and rejected.
+      applyAutoClawCaptchaConfig({ region: config.region, prefix: config.prefix });
+      await loadAutoClawCaptchaSdk(config.sdkUrl || AUTOCLAW_CAPTCHA_SDK_URL);
+      window.initAliyunCaptcha({
+        SceneId: config.sceneId,
+        // Belt and braces: initAliyunCaptcha() accepts both directly as well.
+        ...(config.region ? { region: config.region } : {}),
+        // The SDK silently no-ops without the scene prefix.
+        ...(config.prefix ? { prefix: config.prefix } : {}),
+        mode: "popup",
+        element: "#autoclaw-captcha-element",
+        button: AUTOCLAW_CAPTCHA_TRIGGER,
+        // The Aliyun SDK reads `captchaResult`/`bizResult` off the resolved
+        // value (anything else - including `{}` - is treated as a network
+        // failure, which re-opens the challenge and blocks login).
+        captchaVerifyCallback: (value) => new Promise((resolve) => {
+          const verifyParam = typeof value === "string" ? value : value?.verifyParam;
+          if (!verifyParam) {
+            resolve({
+              captchaResult: false,
+              bizResult: false,
+              msg: "Captcha returned no verification parameter",
+            });
+            return;
+          }
+          // Resolve the widget only after AutoClaw accepted (or rejected) it.
+          setCaptchaError(null);
+          startAutoClawDeviceFlow(verifyParam)
+            .then(() => resolve({ captchaResult: true, bizResult: true }))
+            .catch((err) => {
+              // A rejected proof keeps the user in the challenge (the widget
+              // re-opens on retry); only real failures abandon the flow.
+              if (isAutoClawCaptchaRejection(err.message)) {
+                setCaptchaError(err.message);
+                setCaptchaStatus("ready");
+                setStep("waiting");
+              } else {
+                setError(err.message);
+                setStep("error");
+              }
+              resolve({ captchaResult: false, bizResult: false, msg: err.message });
+            });
+        }),
+        onBizResultCallback: () => {},
+        onError: (err) => {
+          // Surfaced instead of failing silently: a wrong region/prefix shows
+          // up here as an init error.
+          setCaptchaStatus("error");
+          setCaptchaError(
+            (err && (err.message || err.code)) || "AutoClaw captcha failed to start",
+          );
+        },
+        getInstance: (instance) => {
+          captchaInstanceRef.current = instance;
+          setCaptchaStatus("ready");
+          // Only open the challenge if a sign-in button was already pressed;
+          // otherwise the user still has to pick Google or Z.AI.
+          if (pendingAutoClawRef.current) {
+            pendingAutoClawRef.current = null;
+            setTimeout(() => document.querySelector(AUTOCLAW_CAPTCHA_TRIGGER)?.click(), 150);
+          }
+        },
+      });
+    } catch (err) {
+      setCaptchaStatus("error");
+      setCaptchaError(err.message);
+    }
+  }, [provider, startAutoClawDeviceFlow]);
+
+  const presentAutoClawCaptcha = useCallback(() => {
+    const trigger = document.querySelector(AUTOCLAW_CAPTCHA_TRIGGER);
+    if (trigger instanceof HTMLElement) {
+      trigger.click();
+      return true;
+    }
+    return false;
+  }, []);
+
+  // Two explicit entry points: the legacy AutoClaw Google client and the newer
+  // Z.AI account system. Picking one only selects the method - the captcha the
+  // user solves next starts the device flow for that method.
+  const handleAutoClawSignIn = useCallback((method) => {
+    const next = method === "zai" ? "zai" : "google";
+    autoClawMethodRef.current = next;
+    setAutoClawAuthMethod(next);
+    setError(null);
+    setStep("waiting");
+    // The hidden trigger exists as soon as the dialog renders, so its presence
+    // says nothing about the SDK: without a live instance (failed init, or a
+    // previous rejection) mount it again instead of clicking a dead button.
+    if (captchaInstanceRef.current) {
+      pendingAutoClawRef.current = null;
+      presentAutoClawCaptcha();
+    } else {
+      pendingAutoClawRef.current = next;
+      initAutoClawCaptcha();
+    }
+  }, [initAutoClawCaptcha, presentAutoClawCaptcha]);
 
   // Stop the proxy owned by THIS modal session, at most once. Re-renders,
   // repeated closes, and post-completion calls are all no-ops by construction.
@@ -482,6 +700,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
     onCloseRef.current = onClose;
     isOpenRef.current = isOpen;
     startOAuthFlowRef.current = startOAuthFlow;
+    initAutoClawCaptchaRef.current = initAutoClawCaptcha;
   });
 
   // Reset state and start OAuth when modal opens — exactly once per open.
@@ -499,6 +718,12 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
     setAuthMode("browser");
     setPasteToken("");
     setIdeStatus(null);
+    setCaptchaStatus("idle");
+    setCaptchaError(null);
+    setAutoClawAuthMethod("google");
+    autoClawMethodRef.current = "google";
+    pendingAutoClawRef.current = null;
+    captchaInstanceRef.current = null;
     pollingAbortRef.current = false;
     flowRef.current = { proxyStarted: false, proxyProvider: null, stopSent: false };
     // Best-effort IDE detection for paste-token providers (Trae/Windsurf)
@@ -508,7 +733,23 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
         .then((data) => setIdeStatus(data))
         .catch(() => setIdeStatus({ installed: false, path: null }));
     }
-    startOAuthFlowRef.current();
+    if (provider === "autoclaw") {
+      // Flow starts from the captcha callback; the effect below mounts it.
+      // (Same one-shot reset as the sibling setters above - deferred state
+      // updates are the only way to clear a previous attempt's error screen.)
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setStep("waiting");
+    } else {
+      startOAuthFlowRef.current();
+    }
+  }, [isOpen, provider]);
+
+  // AutoClaw captcha mounts once per open. Deferred a tick so the effect body
+  // never sets state synchronously (initAutoClawCaptcha starts with setState).
+  useEffect(() => {
+    if (!isOpen || provider !== "autoclaw") return;
+    const timer = setTimeout(() => initAutoClawCaptchaRef.current?.(), 0);
+    return () => clearTimeout(timer);
   }, [isOpen, provider]);
 
   // Cleanup when the modal closes: abort polling and stop the proxy THIS
@@ -519,6 +760,8 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
     if (isOpen) return;
     pollingAbortRef.current = true;
     openedRef.current = false;
+    captchaInstanceRef.current?.destroy?.();
+    captchaInstanceRef.current = null;
     stopOwnedProxy();
     flowRef.current = { proxyStarted: false, proxyProvider: null, stopSent: false };
   }, [isOpen, provider, stopOwnedProxy]);
@@ -656,6 +899,23 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
   }, [authData, exchangeTokens]);
 
   // Handle manual URL input
+  const handleImportLocal = async () => {
+    try {
+      setImportingLocal(true);
+      setError(null);
+      const res = await fetch(`/api/oauth/${provider}/import-local`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to import from local app");
+      setStep("success");
+      onSuccessRef.current?.();
+    } catch (err) {
+      setError(err.message);
+      setStep("error");
+    } finally {
+      setImportingLocal(false);
+    }
+  };
+
   const handleManualSubmit = async () => {
     try {
       setError(null);
@@ -765,6 +1025,61 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
   return (
     <Modal isOpen={isOpen} title={modalTitle} onClose={handleClose} size="lg">
       <div className="flex flex-col gap-4">
+        {provider === "autoclaw" && step !== "success" && (
+          <div className="flex flex-col gap-2 p-3 rounded-lg border border-primary/30 bg-primary/5">
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-semibold text-text">
+                AutoClaw Desktop Detected
+              </div>
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={handleImportLocal}
+                disabled={importingLocal}
+              >
+                {importingLocal ? "Importing…" : "📥 1-Click Import from App"}
+              </Button>
+            </div>
+            <div className="text-xs text-text-muted">
+              AutoClaw is installed on your PC. Sign in via the AutoClaw app, then click this button to import your tokens instantly without captchas!
+            </div>
+          </div>
+        )}
+        {provider === "autoclaw" && step !== "success" && (
+          <div className="flex flex-col gap-2 p-3 rounded-lg border border-border bg-sidebar/50">
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-semibold text-text">Sign in to AutoClaw</div>
+              {captchaStatus === "loading" && (
+                <span className="text-xs text-text-muted">Loading…</span>
+              )}
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <Button
+                size="sm"
+                onClick={() => handleAutoClawSignIn("google")}
+                disabled={captchaStatus === "loading"}
+                className={autoClawAuthMethod === "google" ? "" : "opacity-90"}
+              >
+                Google account
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => handleAutoClawSignIn("zai")}
+                disabled={captchaStatus === "loading"}
+                className={autoClawAuthMethod === "zai" ? "ring-1 ring-primary" : ""}
+              >
+                Z.AI account
+              </Button>
+            </div>
+            <div className="text-xs text-text-muted">
+              {captchaError ||
+                "Choose where your AutoClaw account lives: the old Google login, or the newer Z.AI account. A captcha opens next and the sign-in URL follows."}
+            </div>
+            <div id="autoclaw-captcha-element" />
+            <button id="autoclaw-captcha-trigger" type="button" className="hidden" aria-hidden="true" />
+          </div>
+        )}
         {/* Proxy OAuth (trae/windsurf/zed): browser flow; paste-token only when configured */}
         {PROXY_OAUTH_PROVIDERS.has(provider) && (step === "waiting" || step === "input" || step === "error") && (
           <>
@@ -842,7 +1157,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
         )}
 
         {/* Waiting + Manual Input combined (non-device-code, non-proxy) */}
-        {(step === "waiting" || step === "input") && !isDeviceCode && !PROXY_OAUTH_PROVIDERS.has(provider) && (
+        {(step === "waiting" || step === "input") && !isDeviceCode && provider !== "autoclaw" && !PROXY_OAUTH_PROVIDERS.has(provider) && (
           <>
             {/* Option A: Auto via popup */}
             <div className="flex items-center gap-2 px-3 py-2 border border-border rounded-lg bg-sidebar/50">
@@ -984,7 +1299,15 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
             <h3 className="text-lg font-semibold mb-2">Connection Failed</h3>
             <p className="text-sm text-red-600 mb-4">{error}</p>
             <div className="flex gap-2">
-              <Button onClick={startOAuthFlow} variant="secondary" fullWidth>
+              <Button
+                onClick={
+                  provider === "autoclaw"
+                    ? () => handleAutoClawSignIn(autoClawAuthMethod)
+                    : startOAuthFlow
+                }
+                variant="secondary"
+                fullWidth
+              >
                 Try Again
               </Button>
               <Button onClick={handleClose} variant="ghost" fullWidth>

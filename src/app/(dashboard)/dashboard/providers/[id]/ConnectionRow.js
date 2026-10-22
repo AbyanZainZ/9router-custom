@@ -22,6 +22,7 @@ export default function ConnectionRow({
   autoPing = null,
   balance = undefined,
   checkIn = null,
+  invite = null,
   expiring = null,
 }) {
   const [showProxyDropdown, setShowProxyDropdown] = useState(false);
@@ -432,6 +433,20 @@ export default function ConnectionRow({
                   {checkIn.state === "running" ? "progress_activity" : "task_alt"}
                 </span>
                 <span className="text-[10px] leading-tight">Check In</span>
+              </button>
+            </Tooltip>
+          )}
+          {invite && (
+            <Tooltip text="Open your AutoClaw invite link (200 pts per friend)">
+              <button
+                onClick={invite.onClick}
+                disabled={invite.state === "running"}
+                className={`flex w-full flex-col items-center rounded px-2 py-1 transition-colors hover:bg-black/5 dark:hover:bg-white/5 ${invite.state === "error" ? "text-red-500" : "text-text-muted hover:text-primary"} disabled:opacity-60`}
+              >
+                <span className="material-symbols-outlined text-[18px]">
+                  {invite.state === "running" ? "progress_activity" : "share"}
+                </span>
+                <span className="text-[10px] leading-tight">Invite</span>
               </button>
             </Tooltip>
           )}

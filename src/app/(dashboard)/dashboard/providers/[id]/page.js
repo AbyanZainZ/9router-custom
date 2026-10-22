@@ -46,6 +46,8 @@ export default function ProviderDetailPage() {
   const [inlineBalances, setInlineBalances] = useState({});
   const [inlineExpiring, setInlineExpiring] = useState({});
   const [checkInStates, setCheckInStates] = useState({});
+  // AutoClaw invite dialog: link + one-time bind of a friend's code.
+  const [inviteDialog, setInviteDialog] = useState(null);
   const [loading, setLoading] = useState(true);
   const [providerNode, setProviderNode] = useState(null);
   const [proxyPools, setProxyPools] = useState([]);
@@ -904,9 +906,25 @@ export default function ProviderDetailPage() {
       );
       const data = await res.json().catch(() => ({}));
       if (data?.ok) {
-        const message = data.alreadyCompleted
-          ? "Already checked in today"
-          : `Checked in +${data.rewardPoints || 0} pts`;
+        // "Check In" now claims every daily AutoClaw grant at once:
+        // login reward + daily_signin + Inspiration Hub.
+        const gained = Number(data.totalGained ?? data.rewardPoints) || 0;
+        const parts = (data.tasks || [])
+          .filter((t) => t.ok && !t.alreadyCompleted && t.rewardPoints > 0)
+          .map((t) => {
+            const label =
+              t.taskId === "daily_signin"
+                ? "check-in"
+                : t.taskId === "daily_inspiration_center"
+                  ? "hub"
+                  : t.taskId;
+            return `${label} +${t.rewardPoints}`;
+          });
+        const message = gained > 0
+          ? `+${gained} pts${parts.length ? ` (${parts.join(", ")})` : ""}`
+          : data.alreadyCompleted
+            ? "All daily rewards already claimed"
+            : "No new reward this time";
         setCheckInStates((prev) => ({ ...prev, [conn.id]: { state: "ok", message } }));
         try {
           const u = await fetch(`/api/usage/${encodeURIComponent(conn.id)}`);
@@ -929,6 +947,78 @@ export default function ProviderDetailPage() {
         ...prev,
         [conn.id]: { state: "error", message: error.message },
       }));
+    }
+  };
+
+  const loadInviteInfo = async (conn) => {
+    try {
+      const res = await fetch(
+        `/api/providers/autoclaw/checkin?connectionId=${encodeURIComponent(conn.id)}&action=invite`,
+      );
+      const data = await res.json().catch(() => ({}));
+      setInviteDialog((prev) =>
+        prev && prev.conn.id === conn.id
+          ? {
+              ...prev,
+              loading: false,
+              info: data?.ok ? data : null,
+              error: data?.ok ? "" : data?.error || "Invite link unavailable",
+            }
+          : prev,
+      );
+    } catch (error) {
+      setInviteDialog((prev) =>
+        prev && prev.conn.id === conn.id ? { ...prev, loading: false, error: error.message } : prev,
+      );
+    }
+  };
+
+  const handleInvite = (conn) => {
+    if (!conn?.id) return;
+    setInviteDialog({
+      conn,
+      loading: true,
+      info: null,
+      code: "",
+      busy: false,
+      error: "",
+      message: "",
+    });
+    loadInviteInfo(conn);
+  };
+
+  const handleBindInvite = async () => {
+    const dialog = inviteDialog;
+    if (!dialog?.conn?.id) return;
+    const code = String(dialog.code || "").trim();
+    if (!code) {
+      setInviteDialog((prev) => ({ ...prev, error: "Enter an invite code first." }));
+      return;
+    }
+    setInviteDialog((prev) => ({ ...prev, busy: true, error: "", message: "" }));
+    try {
+      const res = await fetch(
+        `/api/providers/autoclaw/checkin?connectionId=${encodeURIComponent(dialog.conn.id)}&action=bind-invite`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ inviteCode: code }),
+        },
+      );
+      const data = await res.json().catch(() => ({}));
+      setInviteDialog((prev) =>
+        prev
+          ? {
+              ...prev,
+              busy: false,
+              code: data?.ok ? "" : prev.code,
+              message: data?.ok ? data?.message || "Invite code bound" : "",
+              error: data?.ok ? "" : data?.error || "Bind failed",
+            }
+          : prev,
+      );
+    } catch (error) {
+      setInviteDialog((prev) => ({ ...prev, busy: false, error: error.message }));
     }
   };
 
@@ -1364,6 +1454,11 @@ export default function ProviderDetailPage() {
                   ? { ...(checkInStates[conn.id] || {}), onClick: () => handleCheckIn(conn) }
                   : null
               }
+              invite={
+                providerId === "autoclaw"
+                  ? { onClick: () => handleInvite(conn) }
+                  : null
+              }
               expiring={
                 providerId === "autoclaw" ? inlineExpiring[conn.id] : undefined
               }
@@ -1421,6 +1516,79 @@ export default function ProviderDetailPage() {
   );
 
   const activePools = proxyPools.filter((p) => p.isActive === true);
+
+  const inviteModal = (
+    <Modal
+      isOpen={Boolean(inviteDialog)}
+      onClose={() => setInviteDialog(null)}
+      title="AutoClaw invite"
+      size="sm"
+    >
+      <div className="flex flex-col gap-4">
+        <div className="flex flex-col gap-2">
+          <div className="text-xs font-semibold text-text-main">Your invite link</div>
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              onClick={() => {
+                if (inviteDialog?.info?.url) {
+                  window.open(inviteDialog.info.url, "_blank", "noopener,noreferrer");
+                }
+              }}
+              disabled={!inviteDialog?.info?.url}
+            >
+              Open invite link
+            </Button>
+            <span className="text-xs text-text-muted">
+              {inviteDialog?.loading
+                ? "Loading…"
+                : inviteDialog?.info
+                  ? `${Number(inviteDialog.info.invited) || 0}/${Number(inviteDialog.info.target) || 0} invited`
+                  : "—"}
+            </span>
+          </div>
+          <div className="text-[11px] text-text-muted">
+            Each friend who signs up earns you +800 credits (max 5). The link contains your account token,
+            so share only the invitation itself.
+          </div>
+        </div>
+
+        <div className="h-px bg-border" />
+
+        <div className="flex flex-col gap-2">
+          <div className="text-xs font-semibold text-text-main">Bind a friend&apos;s invite code</div>
+          <div className="flex items-center gap-2">
+            <Input
+              value={inviteDialog?.code || ""}
+              onChange={(e) =>
+                setInviteDialog((prev) => (prev ? { ...prev, code: e.target.value.toUpperCase() } : prev))
+              }
+              placeholder="e.g. LBWTGJFG"
+              className="flex-1"
+            />
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={handleBindInvite}
+              disabled={inviteDialog?.busy || !String(inviteDialog?.code || "").trim()}
+            >
+              {inviteDialog?.busy ? "Binding…" : "Bind"}
+            </Button>
+          </div>
+          {inviteDialog?.message ? (
+            <div className="text-[11px] text-green-600">{inviteDialog.message}</div>
+          ) : null}
+          {inviteDialog?.error ? (
+            <div className="text-[11px] text-red-500">{inviteDialog.error}</div>
+          ) : null}
+          <div className="text-[11px] text-text-muted">
+            One-time per account and cannot be undone. The bonus goes to the code owner, so use it on a
+            brand-new account only.
+          </div>
+        </div>
+      </div>
+    </Modal>
+  );
 
   const bulkActionModal = (
     <Modal
@@ -2371,6 +2539,7 @@ export default function ProviderDetailPage() {
         {renderModelsSection()}
       </Card>
 
+      {inviteModal}
       {bulkActionModal}
 
       {/* Modals */}

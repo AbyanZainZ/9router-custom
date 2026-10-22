@@ -93,14 +93,27 @@ export default {
       "https://autoglm-api.autoglm.ai/userapi/overseasv1/zai-oauth-url",
     zaiTokenUrl:
       "https://autoglm-api.autoglm.ai/userapi/overseasv1/zai-oauth-login",
+    // Server-side challenge config. AutoClaw answers 631002 ("this version has
+    // stopped service") for the OAuth URL request until a captcha verify param
+    // is attached, so the login flow must render this captcha first.
+    captchaConfigUrl:
+      "https://autoglm-api.autoglm.ai/userapi/overseasv1/oauth-captcha-config",
+    captchaSdkUrl:
+      "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js",
     refreshUrl: "https://autoglm-api.autoglm.ai/userapi/v1/refresh",
     refresh: { encoding: "json" },
     userInfoUrl: "https://autoglm-api.autoglm.ai/userapi/v1/user-profile",
     redirectUri: "http://localhost:18432/auth/callback-google",
     callbackPath: "/auth/callback-google",
     fixedPort: 18432,
+    // The desktop client binds these ports in order and keeps the first one
+    // that is free; all of them are registered on AutoClaw's OAuth client, so
+    // the Google redirect works on any of them. Binding only 18432 makes
+    // browser login impossible whenever the AutoClaw app already listens there.
+    callbackPorts: [18432, 19654, 19723, 53699],
     sourceId: "autoclaw",
-    appVersion: "1.18.4",
+    appVersion: "2.2.1",
+    channel: "AutoClaw5",
     // access_token TTL = 24h; refresh proactively.
     refreshLeadMs: 3600 * 1000,
   },

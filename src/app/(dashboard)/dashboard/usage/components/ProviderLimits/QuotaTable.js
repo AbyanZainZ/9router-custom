@@ -84,6 +84,15 @@ function sortQuotas(quotas, sortMode) {
 /**
  * Quota Table Component - Table-based display for quota data
  */
+// Point-based balances (AutoClaw) are whole credits - "9,137 credits" reads
+// better than "9137.00 credits"; currency balances keep two decimals.
+function formatCreditTotal(quota) {
+  const total = Number(quota?.total) || 0;
+  return quota?.currency === "credits"
+    ? Math.round(total).toLocaleString()
+    : total.toFixed(2);
+}
+
 export default function QuotaTable({
   quotas = [],
   compact = false,
@@ -227,14 +236,14 @@ export default function QuotaTable({
                       isUnlimited
                         ? `${quota.used.toLocaleString()} used · Unlimited`
                         : isCreditBalance
-                        ? `Credit balance: ${quota.total.toFixed(2)} ${quota.currency || ""}`
+                        ? `Credit balance: ${formatCreditTotal(quota)} ${quota.currency || ""}`
                         : `${quota.used.toLocaleString()} / ${quota.total > 0 ? quota.total.toLocaleString() : "∞"}`
                     }
                   >
                     {isUnlimited
                       ? `${quota.used.toLocaleString()} used · Unlimited`
                       : isCreditBalance
-                      ? `Credit: ${quota.total.toFixed(2)} ${quota.currency || ""}`
+                      ? `Credit: ${formatCreditTotal(quota)} ${quota.currency || ""}`
                       : `${quota.used.toLocaleString()} / ${quota.total > 0 ? quota.total.toLocaleString() : "∞"}${
                           quota.unit ? ` ${quota.unit}` : ""
                         }`}

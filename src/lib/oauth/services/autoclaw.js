@@ -41,8 +41,10 @@ export class AutoClawService {
       "X-Auth-TimeStamp": ts,
       "X-Auth-Sign": sign,
       "X-Product": "autoclaw",
-      "X-Version": this.config.appVersion || "1.18.4",
+      "X-Version": this.config.appVersion || "2.2.1",
+      "X-Channel": this.config.channel || "AutoClaw5",
       "X-Tm": "win",
+      "X-Lang": "zh-CN",
       "X-Trace-Id": crypto.randomUUID(),
       "Content-Type": "application/json",
     };

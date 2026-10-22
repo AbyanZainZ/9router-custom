@@ -21,7 +21,10 @@ import {
   getSettings,
   updateSettings,
 } from "@/lib/localDb";
-import { checkInAutoClaw } from "open-sse/services/usage/misc.js";
+import {
+  checkInAutoClaw,
+  claimAutoClawLoginReward,
+} from "open-sse/services/usage/misc.js";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { refreshAndUpdateCredentials } from "@/app/api/usage/[connectionId]/route.js";
 
@@ -146,13 +149,35 @@ export async function runAutoClawCheckinTick() {
           // fall back to the existing token
         }
 
-        const res = await checkInAutoClaw(
-          active.accessToken || active.apiKey,
-          active.providerSpecificData,
-          proxyOptions,
-        );
-        results.push({ connectionId: conn.id, provider: "autoclaw", ...res });
-        if (res.ok) {
+        const token = active.accessToken || active.apiKey;
+        const deviceId = active.providerSpecificData?.deviceId;
+
+        // 1. "user active" login reward (the desktop app fires this on start).
+        const login = await claimAutoClawLoginReward(token, deviceId, proxyOptions);
+        // 2. daily check-in task.
+        const res = await checkInAutoClaw(token, active.providerSpecificData, proxyOptions);
+        // 3. Inspiration Hub visit task - same shape, its own reward.
+        let hub = { ok: false, rewardPoints: 0, alreadyCompleted: false };
+        try {
+          hub = await checkInAutoClaw(
+            token,
+            active.providerSpecificData,
+            proxyOptions,
+            "daily_inspiration_center",
+          );
+        } catch {
+          // Optional grant: never fail the tick because of it.
+        }
+
+        results.push({
+          connectionId: conn.id,
+          provider: "autoclaw",
+          ...res,
+          loginOk: login.ok,
+          hubOk: hub.ok,
+          hubRewardPoints: Number(hub.rewardPoints) || 0,
+        });
+        if (res.ok || hub.ok) {
           state[conn.id] = dateKey;
           stateChanged = true;
         }

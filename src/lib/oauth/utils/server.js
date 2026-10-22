@@ -980,11 +980,19 @@ let autoclawProxyPort = 18432;
 let autoclawProxyTimeout = null;
 
 export function registerAutoClawSession(state, deviceId, authMethod = "google", navigateUri = null) {
+  // Abandoned attempts would otherwise pile up in the map, and the callback's
+  // "exactly one live session" fallback only works while the map holds a single
+  // entry. Anything past the OAuth window is dead weight.
+  const staleBefore = Date.now() - 15 * 60 * 1000;
+  for (const [key, value] of autoclawSessions) {
+    if (!value.createdAt || value.createdAt < staleBefore) autoclawSessions.delete(key);
+  }
   autoclawSessions.set(state, {
     state,
     deviceId,
     authMethod,
     navigateUri,
+    callbackState: null,
     status: "pending",
     code: null,
     error: null,
@@ -1028,11 +1036,15 @@ export function handleAutoClawCallback(urlObj) {
   }
 
   session.code = code;
+  // Keep the state exactly as Google echoed it back: AutoClaw signs the state
+  // JWT into the consent URL and verifies that same value on google-oauth-login,
+  // so the exchange must not reuse whatever the URL endpoint returned.
+  session.callbackState = state || null;
   session.status = "exchanging";
-  return { success: true, code, state: session.state };
+  return { success: true, code, state: session.callbackState || session.state };
 }
 
-export function startAutoClawProxy(port = 18432) {
+function startAutoClawProxyOnPort(port) {
   return new Promise((resolve) => {
     if (autoclawProxyServer) {
       resolve({ success: true, port: autoclawProxyPort });
@@ -1081,6 +1093,38 @@ ${result.success ? "<script>let n=3;const c=document.getElementById(\"cd\");cons
       resolve({ success: true, port });
     });
   });
+}
+
+// The desktop client tries a fixed port list and keeps the first free one; all
+// of those ports are registered on AutoClaw's OAuth client, so the Google
+// redirect is accepted on any of them. Trying the whole list matters because
+// the AutoClaw desktop app usually holds 18432 while it runs.
+export async function startAutoClawProxy(ports = [18432, 19654, 19723, 53699]) {
+  if (autoclawProxyServer) {
+    return { success: true, port: autoclawProxyPort };
+  }
+
+  const candidates = (Array.isArray(ports) ? ports : [ports]).filter(
+    (p) => Number.isInteger(p) && p > 0 && p < 65536,
+  );
+  if (!candidates.length) {
+    return { success: false, reason: "no_ports", ports: [] };
+  }
+
+  let last = null;
+  for (const port of candidates) {
+    last = await startAutoClawProxyOnPort(port);
+    if (last.success) return last;
+    console.log(`[autoclaw oauth] callback port ${port} unavailable: ${last.reason}`);
+    if (last.reason !== "port_busy") break;
+  }
+
+  return {
+    success: false,
+    reason: last?.reason || "unknown",
+    error: last?.error,
+    ports: candidates,
+  };
 }
 
 export function stopAutoClawProxy() {

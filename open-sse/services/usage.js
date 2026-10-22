@@ -29,6 +29,7 @@ import {
   getOllamaUsage,
   getVercelAiGatewayUsage,
   getQoderUsage,
+  getAutoClawUsage,
 } from "./usage/misc.js";
 
 /**
@@ -68,6 +69,8 @@ const USAGE_HANDLERS = {
   zed: (c) => getZedUsage(c.accessToken, c.providerSpecificData, c.proxyOptions),
   "xiaomi-mimo": (c) => getXiaomiMimoUsage(c.accessToken, c.providerSpecificData, c.proxyOptions),
   commandcode: (c) => getCommandCodeUsage(c.apiKey, c.proxyOptions),
+  // AutoClaw bills in credits (wallet ledger), not rate-limit windows.
+  autoclaw: (c) => getAutoClawUsage(c.accessToken, c.proxyOptions),
   cursor: (c) => getCursorUsage(c.accessToken, c.providerSpecificData, c.proxyOptions),
 };
 

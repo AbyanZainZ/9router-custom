@@ -4,7 +4,11 @@ import "open-sse/index.js";
 import { getProviderConnectionById, updateProviderConnection } from "@/lib/localDb";
 import {
   checkInAutoClaw,
+  bindAutoClawInviteCode,
+  claimAutoClawLoginReward,
+  getAutoClawInviteUrl,
   getAutoClawTasks,
+  getAutoClawWalletTotal,
   AUTOCLAW_DAILY_SIGNIN_TASK_ID,
 } from "open-sse/services/usage/misc.js";
 import { getExecutor } from "open-sse/executors/index.js";
@@ -62,7 +66,9 @@ export async function POST(request, { params }) {
 
   const url = new URL(request.url);
   const connectionId = url.searchParams.get("connectionId");
-  const taskId = (url.searchParams.get("taskId") || AUTOCLAW_DAILY_SIGNIN_TASK_ID).trim();
+  // No taskId = claim every daily grant (login reward + check-in + Hub).
+  // An explicit taskId narrows the request back to a single task.
+  const taskId = (url.searchParams.get("taskId") || "").trim() || null;
   if (!connectionId) {
     return Response.json({ error: "connectionId is required" }, { status: 400 });
   }
@@ -80,15 +86,72 @@ export async function POST(request, { params }) {
       // Fall back to the existing token.
     }
 
-    let result = await checkInAutoClaw(
-      connection.accessToken || connection.apiKey,
-      connection.providerSpecificData,
-      proxyOptions,
-      taskId,
-    );
+    // ?action=bind-invite { inviteCode } - one-time referral binding for this
+    // account. Separate from the daily claim path below.
+    if (url.searchParams.get("action") === "bind-invite") {
+      let body = {};
+      try {
+        body = await request.json();
+      } catch {
+        body = {};
+      }
+      const bound = await bindAutoClawInviteCode(
+        connection.accessToken || connection.apiKey,
+        connection.providerSpecificData?.deviceId,
+        body?.inviteCode,
+        proxyOptions,
+      );
+      return Response.json(bound, { status: bound.ok ? 200 : 502 });
+    }
+
+    // Three independent daily grants:
+    //  1. user-info ("user active" login reward, 500 during the Oct 19-25 event)
+    //  2. daily_signin      (daily check-in, 400)
+    //  3. daily_inspiration_center (open the Inspiration Hub, 200)
+    // An explicit taskId narrows it back to a single task for callers that
+    // only want the old behaviour.
+    const claimAll = async (conn) => {
+      const token = conn.accessToken || conn.apiKey;
+      const deviceId = conn.providerSpecificData?.deviceId;
+      const before = await getAutoClawWalletTotal(token, proxyOptions);
+
+      const results = [];
+      if (!taskId || taskId === AUTOCLAW_DAILY_SIGNIN_TASK_ID) {
+        const login = await claimAutoClawLoginReward(token, deviceId, proxyOptions);
+        results.push({
+          taskId: "daily_login",
+          ok: login.ok,
+          alreadyCompleted: false,
+          rewardPoints: 0,
+          error: login.error,
+        });
+      }
+
+      const wanted = taskId
+        ? [taskId]
+        : [AUTOCLAW_DAILY_SIGNIN_TASK_ID, "daily_inspiration_center"];
+      for (const id of wanted) {
+        const res = await checkInAutoClaw(token, conn.providerSpecificData, proxyOptions, id);
+        results.push({
+          taskId: id,
+          ok: res.ok,
+          alreadyCompleted: !!res.alreadyCompleted,
+          rewardPoints: Number(res.rewardPoints) || 0,
+          error: res.error,
+        });
+      }
+
+      const after = await getAutoClawWalletTotal(token, proxyOptions);
+      return { results, before, after };
+    };
+
+    let { results, before, after } = await claimAll(connection);
 
     // Token may have been stale mid-flight — force-refresh and retry once.
-    if (!result.ok && /expired|invalid|log in|401|403/i.test(result.error || "") && connection.refreshToken) {
+    const authFailure = results.some(
+      (r) => !r.ok && /expired|invalid|log in|401|403/i.test(r.error || ""),
+    );
+    if (authFailure && connection.refreshToken) {
       try {
         connection = await refreshConnectionIfNeeded(
           { ...connection, expiresAt: null, lastRefreshAt: null },
@@ -97,15 +160,29 @@ export async function POST(request, { params }) {
       } catch {
         // ignore, retry with whatever token we have
       }
-      result = await checkInAutoClaw(
-        connection.accessToken || connection.apiKey,
-        connection.providerSpecificData,
-        proxyOptions,
-        taskId,
-      );
+      ({ results, before, after } = await claimAll(connection));
     }
 
-    return Response.json(result, { status: result.ok ? 200 : 502 });
+    // Only tasks that actually paid out count as a new claim; the login-reward
+    // entry carries no per-task amount, so totalGained is compared as well.
+    const claimed = results.filter((r) => r.ok && !r.alreadyCompleted && r.rewardPoints > 0);
+    const totalGained =
+      Number.isFinite(before) && Number.isFinite(after) ? Math.max(0, after - before) : null;
+    const ok = results.some((r) => r.ok);
+
+    return Response.json(
+      {
+        ok,
+        // Legacy fields kept for the existing row button.
+        taskId: results[results.length - 1]?.taskId,
+        rewardPoints: totalGained ?? claimed.reduce((sum, r) => sum + r.rewardPoints, 0),
+        alreadyCompleted: claimed.length === 0 && !(totalGained > 0),
+        totalGained,
+        balance: Number.isFinite(after) ? after : null,
+        tasks: results,
+      },
+      { status: ok ? 200 : 502 },
+    );
   } catch (error) {
     return Response.json({ error: error.message }, { status: 500 });
   }
@@ -131,6 +208,18 @@ export async function GET(request, { params }) {
   const connection = await getProviderConnectionById(connectionId);
   if (!connection || connection.provider !== "autoclaw") {
     return Response.json({ error: "AutoClaw connection not found" }, { status: 404 });
+  }
+
+  // ?action=invite hands back the referral link (it embeds the account token,
+  // so the UI only opens it instead of rendering it).
+  if (url.searchParams.get("action") === "invite") {
+    const proxyOptions = await buildProxyOptions(connection);
+    const invite = await getAutoClawInviteUrl(
+      connection.accessToken || connection.apiKey,
+      { lang },
+      proxyOptions,
+    );
+    return Response.json(invite, { status: invite.ok ? 200 : 502 });
   }
 
   const result = await getAutoClawTasks(connection.accessToken || connection.apiKey, lang);
